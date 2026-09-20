@@ -253,8 +253,25 @@ impl<T> SetOnce<T> {
         self.value_set.load(Ordering::Acquire)
     }
 
-    // SAFETY: The SetOnce must not be empty.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `SetOnce` is initialized — in practice, that they
+    /// have observed `value_set` as `true` through an `Acquire` load, so that the write
+    /// performed by `set` happens-before this read. The value is never moved out or
+    /// dropped while a shared reference can exist: `into_inner` takes `self` by value and
+    /// `Drop` needs `&mut self`.
     unsafe fn get_unchecked(&self) -> &T {
+        // SAFETY:
+        // Justifies two operations.
+        // 1. `(*ptr).as_ptr()` — `UnsafeCell::with` yields a non-null, aligned pointer to
+        //    the `MaybeUninit<T>`, and `MaybeUninit::as_ptr` requires only a valid place.
+        // 2. `&*..` — creating `&T`. Contract: non-null, aligned, pointing to an
+        //    initialized, valid `T` for the returned lifetime, with no `&mut T` alias.
+        //    Evidence: non-null and aligned from (1); initialization is this function's
+        //    `# Safety` precondition. No writer can alias it: `set` writes only after
+        //    taking the `Notify` waiter-list lock and re-checking `initialized()`, so it
+        //    never writes once `value_set` is true, and `Drop` requires `&mut self`, which
+        //    the `&self` here excludes. The returned lifetime is tied to `&self`.
         unsafe { &*self.value.with(|ptr| (*ptr).as_ptr()) }
     }
 
@@ -358,16 +375,25 @@ impl<T> SetOnce<T> {
     }
 }
 
-// Since `get` gives us access to immutable references of the SetOnce, SetOnce
-// can only be Sync if T is Sync, otherwise SetOnce would allow sharing
-// references of !Sync values across threads. We need T to be Send in order for
-// SetOnce to by Sync because we can use `set` on `&SetOnce<T>` to send values
-// (of type T) across threads.
+// SAFETY: Implementer obligation of `Sync`: `&SetOnce<T>` must be usable from several
+// threads at once. `SetOnce<T>` holds an `UnsafeCell`, which is never `Sync`, so this impl
+// is explicit and rests on the initialisation protocol rather than the field types:
+//
+// - `get`/`wait` hand out `&T` to any number of threads concurrently once the cell is
+//   initialized. Aliased shared access to `T` across threads is exactly `T: Sync`.
+// - `set` on a `&SetOnce<T>` lets a thread deposit a `T` that another thread then
+//   observes — a cross-thread ownership transfer — so `T: Send` is also required.
+//
+// Data-race freedom comes from `set` taking the `Notify` waiter-list lock and re-checking
+// `initialized()` under it (so at most one writer ever runs), plus the `Release` store /
+// `Acquire` load pair on `value_set`, which orders that write before every reader's
+// access.
 unsafe impl<T: Sync + Send> Sync for SetOnce<T> {}
 
-// Access to SetOnce's value is guarded by the Atomic boolean flag
-// and atomic operations on `value_set`, so as long as T itself is Send
-// it's safe to send it to another thread
+// SAFETY: Implementer obligation of `Send`: transferring ownership of a `SetOnce<T>` to
+// another thread transfers the `T` it may hold, which is exactly what `T: Send` licenses.
+// The `AtomicBool` and `Notify` are `Send`. No shared access to `T` is created by the
+// move, so `T: Sync` is not required.
 unsafe impl<T: Send> Send for SetOnce<T> {}
 
 /// Error that can be returned from [`SetOnce::set`].

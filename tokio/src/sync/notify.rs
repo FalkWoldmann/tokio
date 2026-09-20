@@ -392,7 +392,24 @@ pub struct Notified<'a> {
     waiter: Waiter,
 }
 
+// SAFETY: `Notified` is only `!Send`/`!Sync` automatically because it embeds a `Waiter`,
+// which contains `UnsafeCell<Option<Waker>>` and `linked_list::Pointers`. Neither is
+// touched without synchronisation:
+//
+// * `waiter.waker` is accessed under the discipline documented on the `Waiter` fields —
+//   while `notification` is `None` the field is protected by the `Notify`'s `waiters`
+//   lock, and once `notification` is `Some` the waiter has been unlinked and the field is
+//   exclusively owned by this `Notified`. The transition between the two is published by
+//   the `Release` store / `Acquire` load pair on `notification`.
+// * `waiter.pointers` is only read or written while the `waiters` lock is held.
+//
+// So moving the future between threads, or sharing `&Notified`, exposes nothing that is
+// not already synchronised. The only other fields are `&'a Notify` (which is `Sync`, since
+// `Notify` is), a `State` and a `usize`. `Waker` is itself `Send + Sync` (std docs).
 unsafe impl<'a> Send for Notified<'a> {}
+// SAFETY: See the argument for `Send` directly above. Note that `&Notified` exposes no way
+// to reach the `Waiter` at all — `poll_notified` and `enable` need `Pin<&mut Self>` — so
+// sharing one across threads is sound (if not especially useful).
 unsafe impl<'a> Sync for Notified<'a> {}
 
 /// Future returned from [`Notify::notified_owned()`].
@@ -415,6 +432,11 @@ pub struct OwnedNotified {
     waiter: Waiter,
 }
 
+// SAFETY: Identical to the argument for `Notified` above, with `Arc<Notify>` in place of
+// `&'a Notify`: the embedded `Waiter`'s `UnsafeCell` and list pointers are only accessed
+// under the `waiters` lock, or exclusively by this future once `notification` is `Some`
+// and it has been unlinked. `Arc<Notify>` is `Send + Sync` because `Notify` is.
+// `OwnedNotified` is `Send` by the auto impl; only `Sync` needs writing out.
 unsafe impl Sync for OwnedNotified {}
 
 /// A custom `project` implementation is used in place of `pin-project-lite`
@@ -778,13 +800,36 @@ impl Notify {
             while wakers.can_push() {
                 match list.pop_back_locked(&mut waiters) {
                     Some(waiter) => {
-                        // Safety: we never make mutable references to waiters.
+                        // SAFETY:
+                        // Operation: `waiter.as_ref()`, creating `&Waiter`.
+                        // Contract: aligned, initialized, live for the returned lifetime,
+                        // with no `&mut` alias.
+                        // Evidence: the node was pushed onto this list from a pinned
+                        // `Waiter` inside a live `Notified`/`OwnedNotified` future, and
+                        // that future's `Drop` unlinks it under this same `waiters` lock
+                        // before its storage is released — we hold that lock. No `&mut
+                        // Waiter` is ever created anywhere in this module (the list is
+                        // manipulated through raw pointers and `UnsafeCell`), so the
+                        // shared reference is not aliased by a unique one.
                         let waiter = unsafe { waiter.as_ref() };
 
-                        // Safety: we hold the lock, so we can access the waker.
-                        if let Some(waker) =
-                            unsafe { waiter.waker.with_mut(|waker| (*waker).take()) }
-                        {
+                        // SAFETY:
+                        // Operation: `waker.with_mut(|waker| (*waker).take())` — a
+                        // read-modify-write of the `Option<Waker>` cell.
+                        // Contract: non-null, aligned, valid for reads and writes,
+                        // initialized, and no concurrent access.
+                        // Evidence: `UnsafeCell::with_mut` gives the first three;
+                        // `Waiter::new` initializes the field to `None`. For exclusivity,
+                        // the `Waiter` fields document that while `notification` is
+                        // `None` the `waker` field is protected by the `waiters` lock —
+                        // which we hold — and this waiter's `notification` is still
+                        // `None`, because the `store_release(Notification::All)` that
+                        // hands ownership to the future happens on the line below, after
+                        // the waiter has been unlinked by `pop_back_locked`.
+                        // Postcondition: the cell is left as `None` and the `Waker` moves
+                        // into `wakers`, so it is woken exactly once.
+                        let waker = unsafe { waiter.waker.with_mut(|waker| (*waker).take()) };
+                        if let Some(waker) = waker {
                             wakers.push(waker);
                         }
 
@@ -1005,9 +1050,21 @@ impl Notified<'_> {
     }
 
     fn project(self: Pin<&mut Self>) -> NotifiedProject<'_> {
+        // SAFETY: This is a pin projection.
+        // Contract from `Pin::get_unchecked_mut`: the caller must not use the returned
+        // `&mut Self` to move the pointee or otherwise break the `Pin` contract for any
+        // `!Unpin` part of it.
+        // Evidence: the `&mut Self` is used only to reborrow four fields. Three of them —
+        // `notify`, `state`, `notify_waiters_calls` — are `Unpin`, asserted at compile
+        // time by the `is_unpin::<..>()` calls below so the claim cannot go stale if a
+        // field's type changes, and projecting `Unpin` fields out of a pinned struct is
+        // unconditionally sound. The fourth, `waiter`, is `!Unpin` (it holds
+        // `PhantomPinned`) and is projected only as `&Waiter`, never `&mut Waiter`, so it
+        // cannot be moved out or replaced through this projection. `Notified` is
+        // constructed only behind a `Pin`, so the `Waiter`'s address is stable until the
+        // future is dropped — which is what the intrusive list relies on, and what
+        // `Notified`'s custom `Drop` (which unlinks the waiter) terminates.
         unsafe {
-            // Safety: `notify`, `state` and `notify_waiters_calls` are `Unpin`.
-
             is_unpin::<&Notify>();
             is_unpin::<State>();
             is_unpin::<usize>();
@@ -1060,9 +1117,12 @@ impl OwnedNotified {
     /// A custom `project` implementation is used in place of `pin-project-lite`
     /// as a custom drop implementation is needed.
     fn project(self: Pin<&mut Self>) -> NotifiedProject<'_> {
+        // SAFETY: Identical to `Notified::project` above — the `&mut Self` obtained from
+        // `Pin::get_unchecked_mut` is used only to reborrow three `Unpin` fields (asserted
+        // at compile time below) plus a shared `&Waiter`, so nothing `!Unpin` can be moved
+        // through this projection, and `OwnedNotified`'s custom `Drop` unlinks the waiter
+        // before its storage goes away.
         unsafe {
-            // Safety: `notify`, `state` and `notify_waiters_calls` are `Unpin`.
-
             is_unpin::<&Notify>();
             is_unpin::<State>();
             is_unpin::<usize>();
@@ -1372,9 +1432,21 @@ impl NotifiedProject<'_> {
     }
 }
 
-/// # Safety
-///
-/// `Waiter` is forced to be !Unpin.
+// SAFETY: Implementer obligations of `linked_list::Link`:
+//
+// * `as_raw`/`from_raw` must round-trip a handle through a raw pointer. Here
+//   `Handle == Target == NonNull<Waiter>`, so both are the identity function and the
+//   round-trip is exact; `from_raw` takes no ownership and so adds no obligation.
+// * `pointers` must return the `Pointers` belonging to `target` without creating an
+//   intermediate reference, so that the result keeps the argument's Stacked Borrows tag.
+//   Discharged by `Waiter::addr_of_pointers`, which `generate_addr_of_methods!` expands to
+//   a `&raw mut` projection. Its own precondition — that `target` be valid — is passed
+//   through from this method's caller.
+// * The list stores raw pointers to nodes that must not move while linked. `Waiter`
+//   contains `PhantomPinned`, so it is `!Unpin` and safe code cannot move a pinned one.
+//   Nodes are enqueued from a pinned `Notified`/`OwnedNotified` and unlinked again by that
+//   future's custom `Drop`, both under the `Notify`'s `waiters` lock, so no node is
+//   reachable from the list once its storage goes away.
 unsafe impl linked_list::Link for Waiter {
     type Handle = NonNull<Waiter>;
     type Target = Waiter;
@@ -1388,6 +1460,13 @@ unsafe impl linked_list::Link for Waiter {
     }
 
     unsafe fn pointers(target: NonNull<Waiter>) -> NonNull<linked_list::Pointers<Waiter>> {
+        // SAFETY:
+        // Contract from `Waiter::addr_of_pointers` (expanding to
+        // `&raw mut (*target).pointers`): `target` must point to an allocation laid out
+        // for `Waiter`. That is exactly this method's own `# Safety` precondition,
+        // inherited from `Link::pointers`, and nothing intervenes before the call. Using
+        // `&raw mut` rather than a reference is what satisfies `Link::pointers`'
+        // no-intermediate-reference requirement.
         unsafe { Waiter::addr_of_pointers(target) }
     }
 }

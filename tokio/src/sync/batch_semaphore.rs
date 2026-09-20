@@ -251,6 +251,28 @@ impl Semaphore {
         self.permits.fetch_or(Self::CLOSED, Release);
         waiters.closed = true;
         while let Some(mut waiter) = waiters.queue.pop_back() {
+            // SAFETY:
+            // Two operations.
+            // 1. `waiter.as_mut()` — creating `&mut Waiter`. Contract: aligned, pointing
+            //    to an initialized `Waiter`, live for the returned lifetime, and unique.
+            //    Evidence: `pop_back` returns a node that was pushed by `Acquire::poll`
+            //    from a `Pin<&mut Waiter>` owned by a still-live `Acquire` future; that
+            //    future's `Drop` removes the node from the queue under this same lock
+            //    before it can be deallocated, and we hold the lock, so the node is live.
+            //    `pop_back` has already unlinked it, and every other accessor of a queued
+            //    `Waiter` also holds this lock, so the reference is unique.
+            // 2. `waker.with_mut(|waker| (*waker).take())` — a read-modify-write of the
+            //    `Option<Waker>` cell. Contract: non-null, aligned, valid for reads and
+            //    writes, initialized, no concurrent access. `UnsafeCell::with_mut` gives
+            //    the first three, `Waiter::new` initializes the field, and the field's own
+            //    `# Safety` doc says it may only be accessed while the wait queue is
+            //    locked — which `waiters` holds for this whole loop.
+            // Postcondition: the cell is left as `None` and ownership of the `Waker` moves
+            // to this thread, so waking it below cannot double-wake.
+            //
+            // Note the `Waker::wake` call below runs vtable code this module does not
+            // control, but it happens after `take()` has restored the cell to a valid
+            // state, so a panic there cannot leave the `Waiter` torn.
             let waker = unsafe { waiter.as_mut().waker.with_mut(|waker| (*waker).take()) };
             if let Some(waker) = waker {
                 waker.wake();
@@ -325,9 +347,15 @@ impl Semaphore {
                     }
                 };
                 let mut waiter = waiters.queue.pop_back().unwrap();
-                if let Some(waker) =
-                    unsafe { waiter.as_mut().waker.with_mut(|waker| (*waker).take()) }
-                {
+                // SAFETY: Identical to the proof in `Semaphore::close` above — the node
+                // was just unlinked by `pop_back`, the `Acquire` future that owns it
+                // cannot deallocate it without taking this same lock, and we hold the lock
+                // (`waiters`), which is exactly the access condition documented on the
+                // `waker` field. `take()` leaves the cell valid and moves the `Waker` out,
+                // so the deferred `wakers.push(waker)` cannot double-wake.
+                // SAFETY: see the proof directly above.
+                let waker = unsafe { waiter.as_mut().waker.with_mut(|waker| (*waker).take()) };
+                if let Some(waker) = waker {
                     wakers.push(waker);
                 }
             }
@@ -508,6 +536,22 @@ impl Semaphore {
 
         // If the waiter is not already in the wait queue, enqueue it.
         if !queued {
+            // SAFETY:
+            // Two operations.
+            // 1. `Pin::into_inner_unchecked(node)` — contract: the caller must uphold the
+            //    `Pin` guarantees for the pointee by hand from here on, i.e. must not move
+            //    the `Waiter` or invalidate its storage before its destructor runs.
+            //    Evidence: the raw pointer produced here is stored in the intrusive queue,
+            //    and the node is removed again — under this same lock — by
+            //    `Acquire::drop`, which runs before the `Acquire` future's storage can be
+            //    reused. The `Waiter` itself is `!Unpin` (it holds `linked_list::Pointers`,
+            //    which is `!Unpin`), so safe code cannot move it out of the `Pin` either.
+            // 2. `NonNull::new_unchecked(node)` — contract: the pointer must be non-null.
+            //    Evidence: it derives from `Pin<&mut Waiter>`, and references are never
+            //    null (Rust Reference validity rules).
+            // Postcondition: the queue now holds a raw pointer to this `Waiter`. Its
+            // validity is the responsibility of `Acquire::drop`, which unlinks it; that is
+            // the invariant every `waiter.as_mut()` in this file cites.
             let node = unsafe {
                 let node = Pin::into_inner_unchecked(node) as *mut _;
                 NonNull::new_unchecked(node)
@@ -665,9 +709,28 @@ impl<'a> Acquire<'a> {
 
     fn project(self: Pin<&mut Self>) -> (Pin<&mut Waiter>, &Semaphore, usize, &mut bool) {
         fn is_unpin<T: Unpin>() {}
+        // SAFETY: This is a pin projection. Two operations.
+        // 1. `self.get_unchecked_mut()` — contract from `Pin::get_unchecked_mut`: the
+        //    caller must not move the pointee, nor otherwise violate the `Pin` contract
+        //    for any `!Unpin` part of it, using the returned `&mut Self`.
+        //    Evidence: the `&mut Acquire` is used only to reborrow the four fields below.
+        //    Three of them are handed out as plain references and are `Unpin` — asserted
+        //    at compile time by the `is_unpin::<..>()` calls above, so the assertion
+        //    cannot silently go stale if a field's type changes — and projecting `Unpin`
+        //    fields out of a pinned struct is unconditionally sound. The fourth, `node`,
+        //    is re-pinned rather than exposed as `&mut`.
+        // 2. `Pin::new_unchecked(&mut this.node)` — contract: the pointee must stay pinned
+        //    (never moved, deallocated or repurposed without being dropped) until its
+        //    destructor runs, and the pointer type's `Deref`/`DerefMut`/`Drop` impls must
+        //    not move out of it.
+        //    Evidence: the pointer type is `&mut Waiter`, whose `Deref`/`DerefMut` are the
+        //    compiler's own and cannot move the pointee, and which has no `Drop`. The
+        //    `Waiter` lives inside `self`, which is itself pinned, so its address is
+        //    stable for the rest of its life; `Acquire` is only ever created inside
+        //    `Acquire::new`/`poll` behind a `Pin`, and `Waiter` is `!Unpin`, so safe code
+        //    cannot move it. The obligation ends when the `Waiter` is dropped as part of
+        //    `Acquire`'s destructor, which first unlinks it from the wait list.
         unsafe {
-            // Safety: all fields other than `node` are `Unpin`
-
             is_unpin::<&Semaphore>();
             is_unpin::<&mut bool>();
             is_unpin::<usize>();
@@ -698,7 +761,20 @@ impl Drop for Acquire<'_> {
 
         // remove the entry from the list
         let node = NonNull::from(&mut self.node);
-        // Safety: we have locked the wait list.
+        // SAFETY:
+        // Contract from `LinkedList::remove`: the node must either be in *this* list or in
+        // no list at all, and the caller must have exclusive access to the list.
+        // Evidence:
+        // - `node` points at this future's own `Waiter`, which is only ever pushed onto
+        //   `self.semaphore.waiters.queue` (in `poll_acquire`), and `waiters` is the guard
+        //   for that same list. If it was never enqueued, its `Pointers` are still the
+        //   unlinked state `Waiter::new` created.
+        // - Exclusive access: `waiters` is the `MutexGuard` for the wait list, held across
+        //   this call.
+        // - The node is live: it is a field of `self`, and this runs in `Acquire::drop`
+        //   before the future's storage is released.
+        // Postcondition: the queue no longer references this `Waiter`, which is what makes
+        // it sound for the future's storage to go away next.
         unsafe { waiters.queue.remove(node) };
 
         let acquired_permits = self.num_permits - self.node.state.load(Acquire);
@@ -759,9 +835,23 @@ impl fmt::Display for TryAcquireError {
 
 impl std::error::Error for TryAcquireError {}
 
-/// # Safety
-///
-/// `Waiter` is forced to be !Unpin.
+// SAFETY: Implementer obligations of `linked_list::Link`:
+//
+// * `as_raw`/`from_raw` must round-trip a handle through a raw pointer. Here
+//   `Handle == Target == NonNull<Waiter>`, so both are the identity function and the
+//   round-trip is trivially exact; `from_raw` adds no obligation of its own because it
+//   takes no ownership.
+// * `pointers` must return the `Pointers` belonging to `target`, and must not create an
+//   intermediate reference while doing so (so that the returned pointer keeps the same
+//   Stacked Borrows tag as the argument). It is discharged by `Waiter::addr_of_pointers`,
+//   which `generate_addr_of_methods!` expands to a `&raw mut` projection — no reference is
+//   materialised. Its own precondition, that `target` be valid, is passed straight through
+//   from this method's caller.
+// * The list stores raw pointers to nodes that must not move while linked. `Waiter`
+//   contains `linked_list::Pointers`, which is `!Unpin`, so `Waiter` is `!Unpin` too and
+//   safe code cannot move a pinned one. Nodes are enqueued from a `Pin<&mut Waiter>` in
+//   `Acquire::poll` and unlinked again in `Acquire::drop`, both under the wait-list lock,
+//   so no node is reachable from the list after its storage goes away.
 unsafe impl linked_list::Link for Waiter {
     type Handle = NonNull<Waiter>;
     type Target = Waiter;
@@ -775,6 +865,14 @@ unsafe impl linked_list::Link for Waiter {
     }
 
     unsafe fn pointers(target: NonNull<Waiter>) -> NonNull<linked_list::Pointers<Waiter>> {
+        // SAFETY:
+        // Contract from `Waiter::addr_of_pointers` (generated by
+        // `generate_addr_of_methods!`, expanding to `&raw mut (*target).pointers`):
+        // `target` must point to an allocation laid out for `Waiter`.
+        // Evidence: that is exactly this method's own `# Safety` precondition, inherited
+        // from `Link::pointers`, and nothing happens between accepting it and this call.
+        // The expansion forms the pointer with `&raw mut` rather than through a reference,
+        // which is what satisfies `Link::pointers`' no-intermediate-reference requirement.
         unsafe { Waiter::addr_of_pointers(target) }
     }
 }

@@ -104,6 +104,23 @@ impl<T: Eq> Eq for OnceCell<T> {}
 impl<T> Drop for OnceCell<T> {
     fn drop(&mut self) {
         if self.initialized_mut() {
+            // SAFETY:
+            // Justifies two operations.
+            // 1. `(*ptr).as_mut_ptr()` — `UnsafeCell::with_mut` yields a non-null, aligned
+            //    pointer to the `MaybeUninit<T>`, and `MaybeUninit::as_mut_ptr` requires
+            //    only a valid place, not an initialized one.
+            // 2. `ptr::drop_in_place(..)` — contract: the pointer must be non-null,
+            //    properly aligned, valid for reads and writes, and point to a valid
+            //    (initialized) `T` that nothing else accesses while the destructor runs.
+            //    Evidence: non-null and aligned from (1); initialization from
+            //    `initialized_mut()`, which reads `value_set` through `get_mut` — a
+            //    non-atomic read that is exact because we hold `&mut self`. By the cell's
+            //    protocol `value_set` is set to `true` only by `set_value`, after it has
+            //    written an owned `T`. Exclusivity holds because this is `Drop::drop`, so
+            //    we have `&mut self` and no other reference to the cell can exist.
+            // Postcondition: the `T` is dropped exactly once. `value_set` is not reset,
+            // which is fine because the cell is being destroyed; `into_inner` *does* reset
+            // it precisely so that this destructor does not run a second time.
             unsafe {
                 self.value
                     .with_mut(|ptr| ptr::drop_in_place((*ptr).as_mut_ptr()));
@@ -242,12 +259,34 @@ impl<T> OnceCell<T> {
         *self.value_set.get_mut()
     }
 
-    // SAFETY: The OnceCell must not be empty.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `OnceCell` is initialized — in practice, that they
+    /// have observed `value_set` as `true` through an `Acquire` load (or equivalent), so
+    /// that the write performed by `set_value` happens-before this read. The value must
+    /// also not be moved out or dropped for the returned lifetime, which is guaranteed for
+    /// a `OnceCell` because the only paths that do so (`into_inner` and `Drop`) require
+    /// ownership or `&mut self`.
     unsafe fn get_unchecked(&self) -> &T {
+        // SAFETY:
+        // Justifies two operations.
+        // 1. `(*ptr).as_ptr()` — `UnsafeCell::with` yields a non-null, aligned pointer to
+        //    the `MaybeUninit<T>`, and `MaybeUninit::as_ptr` requires only a valid place.
+        // 2. `&*..` — creating `&T`. Contract: non-null, aligned, pointing to an
+        //    initialized, valid `T` for the returned lifetime, with no `&mut T` alias.
+        //    Evidence: non-null and aligned from (1); initialization is this function's
+        //    `# Safety` precondition. No `&mut T` can alias it: `get_unchecked_mut` and
+        //    `Drop` both require `&mut self`, which the `&self` here excludes, and
+        //    `set_value` writes only while `value_set` is still `false`, which the
+        //    precondition rules out. The returned lifetime is tied to `&self`.
         unsafe { &*self.value.with(|ptr| (*ptr).as_ptr()) }
     }
 
-    // SAFETY: The OnceCell must not be empty.
+    /// # Safety
+    ///
+    /// The caller must ensure that the `OnceCell` is initialized. `&mut self` supplies the
+    /// exclusivity, so unlike [`Self::get_unchecked`] no synchronisation argument is
+    /// needed: the caller can read `value_set` non-atomically via `get_mut`.
     unsafe fn get_unchecked_mut(&mut self) -> &mut T {
         // SAFETY:
         //
@@ -257,7 +296,25 @@ impl<T> OnceCell<T> {
     }
 
     fn set_value(&self, value: T, permit: SemaphorePermit<'_>) -> &T {
-        // SAFETY: We are holding the only permit on the semaphore.
+        // SAFETY:
+        // Justifies two operations.
+        // 1. `(*ptr).as_mut_ptr()` — `UnsafeCell::with_mut` yields a non-null, aligned
+        //    pointer to the `MaybeUninit<T>`; `MaybeUninit::as_mut_ptr` needs only a valid
+        //    place, not an initialized one.
+        // 2. `.write(value)` — contract from `ptr::write`: non-null, aligned, valid for
+        //    writes; it does not require the destination to be initialized and does not
+        //    drop the old contents.
+        //    Evidence: non-null and aligned from (1). Exclusivity: the caller holds
+        //    `permit`, and the `OnceCell`'s semaphore is created with a single permit
+        //    which is never released — `set_value` calls `semaphore.close()` and
+        //    `permit.forget()` below — so exactly one call to `set_value` can ever reach
+        //    this line for a given cell. Readers are excluded because they all go through
+        //    `initialized()`/`get_unchecked`, which require `value_set == true`, and that
+        //    flag is only stored (with `Release`) *after* this write.
+        //    Not dropping the old contents is correct rather than a leak: the cell is
+        //    uninitialized until this point.
+        // Postcondition: the cell owns `value`. The `Release` store below publishes it,
+        // pairing with the `Acquire` load in `initialized()`.
         unsafe {
             self.value.with_mut(|ptr| (*ptr).as_mut_ptr().write(value));
         }
@@ -276,6 +333,14 @@ impl<T> OnceCell<T> {
     /// `None` if the `OnceCell` is empty.
     pub fn get(&self) -> Option<&T> {
         if self.initialized() {
+            // SAFETY:
+            // Contract from `get_unchecked`: the cell is initialized, established through
+            // an `Acquire` load.
+            // Evidence: `initialized()` returned true, and it performs exactly that
+            // `Acquire` load of `value_set`, which synchronizes with the `Release` store
+            // in `set_value` and therefore orders the value's initialization before this
+            // read. `value_set` is never reset while a shared reference can exist
+            // (`into_inner` takes `self` by value and `take` takes `&mut self`).
             Some(unsafe { self.get_unchecked() })
         } else {
             None
@@ -290,6 +355,11 @@ impl<T> OnceCell<T> {
     /// no other references exist.
     pub fn get_mut(&mut self) -> Option<&mut T> {
         if self.initialized_mut() {
+            // SAFETY:
+            // Contract from `get_unchecked_mut`: the cell is initialized.
+            // Evidence: `initialized_mut()` returned true. It reads `value_set` through
+            // `AtomicBool::get_mut`, which is sound and exact here because we hold
+            // `&mut self`; no synchronisation is needed for the same reason.
             Some(unsafe { self.get_unchecked_mut() })
         } else {
             None
@@ -443,6 +513,23 @@ impl<T> OnceCell<T> {
         if self.initialized_mut() {
             // Set to uninitialized for the destructor of `OnceCell` to work properly
             *self.value_set.get_mut() = false;
+            // SAFETY:
+            // Justifies two operations.
+            // 1. `ptr::read(ptr)` where `ptr: *const MaybeUninit<T>` — contract: non-null,
+            //    aligned, valid for reads, pointing to a valid value at that type.
+            //    Evidence: `UnsafeCell::with` yields a non-null, aligned pointer to the
+            //    cell's contents; `MaybeUninit<T>` is a valid value for any byte pattern
+            //    (std docs), so no initialization premise is needed for this step.
+            // 2. `.assume_init()` — contract: the `MaybeUninit<T>` must hold a valid,
+            //    initialized `T`.
+            //    Evidence: `initialized_mut()` returned true just above, read through
+            //    `&mut self` so it is exact, and `value_set` is set to `true` only by
+            //    `set_value` after it wrote an owned `T`. Ownership: `into_inner` takes
+            //    `self` by value, so no other reference to the cell exists.
+            // Postcondition: ownership of the `T` moves to the caller by a bitwise copy,
+            // and the cell's bytes still hold that copy. The `value_set = false` store
+            // above is what makes this sound: without it, `OnceCell::drop` (which runs on
+            // `self` at the end of this function) would drop the same `T` a second time.
             Some(unsafe { self.value.with(|ptr| ptr::read(ptr).assume_init()) })
         } else {
             None
@@ -456,16 +543,24 @@ impl<T> OnceCell<T> {
     }
 }
 
-// Since `get` gives us access to immutable references of the OnceCell, OnceCell
-// can only be Sync if T is Sync, otherwise OnceCell would allow sharing
-// references of !Sync values across threads. We need T to be Send in order for
-// OnceCell to by Sync because we can use `set` on `&OnceCell<T>` to send values
-// (of type T) across threads.
+// SAFETY: Implementer obligation of `Sync`: `&OnceCell<T>` must be usable from several
+// threads at once. `OnceCell<T>` holds an `UnsafeCell`, which is never `Sync`, so this
+// impl is explicit and rests on the initialisation protocol rather than the field types:
+//
+// - `get`/`get_or_init` hand out `&T` to any number of threads concurrently once the cell
+//   is initialized. Aliased shared access to `T` across threads is exactly `T: Sync`.
+// - `set`/`get_or_init` on a `&OnceCell<T>` let a thread deposit a `T` that another thread
+//   then observes — a cross-thread ownership transfer — so `T: Send` is also required.
+//
+// Data-race freedom comes from the single-permit `Semaphore` (only one initialiser can
+// ever run `set_value`) plus the `Release` store / `Acquire` load pair on `value_set`,
+// which orders the initializing write before every reader's access.
 unsafe impl<T: Sync + Send> Sync for OnceCell<T> {}
 
-// Access to OnceCell's value is guarded by the semaphore permit
-// and atomic operations on `value_set`, so as long as T itself is Send
-// it's safe to send it to another thread
+// SAFETY: Implementer obligation of `Send`: transferring ownership of a `OnceCell<T>` to
+// another thread transfers the `T` it may hold, which is exactly what `T: Send` licenses.
+// The `AtomicBool` and `Semaphore` are `Send`. No shared access to `T` is created by the
+// move, so `T: Sync` is not required.
 unsafe impl<T: Send> Send for OnceCell<T> {}
 
 /// Errors that can be returned from [`OnceCell::set`].

@@ -186,6 +186,39 @@ impl AtomicWaker {
             .unwrap_or_else(|x| x)
         {
             WAITING => {
+                // SAFETY:
+                // Operations: every `self.waker.with_mut(|t| ..)` in this block — two
+                // accesses on the `Ok` path (`(*t).take()` then `*t = Some(new_waker)`)
+                // and one on the concurrent-wake path (`(*t).take()`).
+                // Required contract for each: `t` must be non-null, aligned, valid for
+                // reads and writes of `Option<Waker>`, point to an initialized value, and
+                // not be accessed concurrently by anyone else.
+                // Evidence:
+                // - `UnsafeCell::with_mut` yields a non-null, aligned pointer to the
+                //   cell's contents, and the `AtomicWaker` is live because `&self` borrows
+                //   it. The `Option<Waker>` is initialized in `AtomicWaker::new` (to
+                //   `None`) and only ever assigned whole `Option<Waker>` values.
+                // - Exclusivity comes from the state lock: this arm is reached only after
+                //   the `compare_exchange(WAITING, REGISTERING, ..)` above *succeeded*, so
+                //   this thread owns the `REGISTERING` bit. `do_register` gives up on
+                //   seeing any state other than `WAITING`, so no second registrar can
+                //   touch the cell; and `take_waker` touches it only in its `WAITING` arm,
+                //   i.e. only when its `fetch_or(WAKING, AcqRel)` observed the state as
+                //   exactly `WAITING`, which it is not while we hold `REGISTERING`. The
+                //   lock is released by the `compare_exchange(REGISTERING, WAITING, ..)`
+                //   or the `swap(WAITING, AcqRel)` below, both after the last cell access.
+                // - Ordering: the `Acquire` on the acquiring CAS synchronizes with the
+                //   `Release`/`AcqRel` store that released the lock previously, so the
+                //   previous holder's writes to the cell are visible.
+                //
+                // Unwind safety (the reason for the `catch_unwind` calls): `into_waker`
+                // and `Waker::{wake, drop}` run vtable functions that this module does not
+                // control and that may panic. None of them is called while the cell is in
+                // a torn state — `take()`/assignment are the only operations and each
+                // leaves a valid `Option<Waker>` — and every path out of this block,
+                // panicking or not, releases the state lock before propagating, so an
+                // unwind can leak a `Waker` but cannot leave the lock held or the cell
+                // invalid.
                 unsafe {
                     // If `into_waker` panics (because it's code outside of
                     // AtomicWaker) we need to prime a guard that is called on
@@ -354,7 +387,21 @@ impl fmt::Debug for AtomicWaker {
     }
 }
 
+// SAFETY: Implementer obligation of `Send`: transferring an `AtomicWaker` to another
+// thread transfers the `Option<Waker>` in its cell. `Waker` is unconditionally `Send`
+// (std docs), and `AtomicUsize` is `Send`, so the transfer moves nothing that is not
+// already permitted to cross threads. The impl is only explicit because `UnsafeCell<T>`
+// blocks the auto impl for `Sync` and both are written out together.
 unsafe impl Send for AtomicWaker {}
+// SAFETY: Implementer obligation of `Sync`: `&AtomicWaker` must be usable from several
+// threads at once — that is the whole point of the type, which is a multi-consumer,
+// single-producer transfer cell. `UnsafeCell<Option<Waker>>` is never `Sync`, so this impl
+// is explicit and its soundness rests on the `state` lock rather than the field type:
+// the cell is touched only by the thread that owns the `REGISTERING` bit (in
+// `do_register`) or the one that observed the state as exactly `WAITING` when setting
+// `WAKING` (in `take_waker`), and those two are mutually exclusive by construction. The
+// `Acquire`/`Release` pairing on every acquisition and release of that lock orders the
+// accesses. `Waker` is itself `Send + Sync` (std docs), so no bound is needed.
 unsafe impl Sync for AtomicWaker {}
 
 trait WakerRef {

@@ -472,7 +472,22 @@ struct Recv<'a, T> {
 // from `Recv`.
 struct WaiterCell(UnsafeCell<Waiter>);
 
+// SAFETY: `WaiterCell` exists purely to confine these two impls, so that `Recv` can derive
+// `Send`/`Sync` without an unsafe impl of its own that would also cover its other fields.
+//
+// Implementer obligation of `Send`: transferring a `WaiterCell` to another thread
+// transfers the `Waiter` inside, whose only non-trivially-`Send` part is the
+// `Option<Waker>` — and `Waker` is unconditionally `Send` (std docs). `AtomicBool`,
+// `linked_list::Pointers` and `PhantomPinned` are `Send`.
 unsafe impl Send for WaiterCell {}
+// SAFETY: Implementer obligation of `Sync`: `&WaiterCell` must be usable from several
+// threads at once. `UnsafeCell<Waiter>` is never `Sync`, so this impl is explicit and
+// rests on the access discipline rather than the field type: the `Waiter` inside is
+// dereferenced only while the `Shared::tail` mutex is held — by `Recv::poll` and
+// `Recv::drop` on the receiving side, and by `Sender::send`/`notify_rx` on the notifying
+// side — with the `queued` flag (written `Release`, read `Acquire`) marking whether the
+// node is linked into the tail's waiter list. No two of those can run concurrently, so
+// `&WaiterCell` never yields concurrent access to the `Waiter`.
 unsafe impl Sync for WaiterCell {}
 
 /// Max number of receivers. Reserve space to lock.
@@ -1040,9 +1055,30 @@ impl<T> Shared<T> {
             while wakers.can_push() {
                 match list.pop_back_locked(&mut tail) {
                     Some(waiter) => {
+                        // SAFETY:
+                        // Operations: the raw dereferences `(*waiter.as_ptr()).waker` and
+                        // `&(*waiter.as_ptr()).queued` below.
+                        // Required contract: `waiter` must be non-null (given by
+                        // `NonNull`), aligned, point to a live initialized `Waiter`, and
+                        // not be accessed concurrently — `waker.take()` in particular is a
+                        // read-modify-write of an `Option<Waker>`.
+                        // Evidence:
+                        // - Liveness and initialization: the node was linked into this
+                        //   list from the `WaiterCell` of a live, pinned `Recv` future,
+                        //   and `Recv::drop` unlinks it under the same `tail` lock before
+                        //   the future's storage is released.
+                        // - Exclusivity: we hold the `tail` lock for this whole loop (the
+                        //   `WaitersList` wrapper enforces that the list is only modified
+                        //   under it), and every other accessor of a queued `Waiter` —
+                        //   `Recv::poll` and `Recv::drop` — takes that same lock.
+                        // - Aliasing: no `&mut Waiter` is created here; the accesses go
+                        //   through raw pointers, so the `&Waiter`-versus-`&mut Waiter`
+                        //   question does not arise.
+                        // Postcondition: the `Waker` moves into `wakers` (so it is woken
+                        // exactly once), and the `Release` store to `queued` below hands
+                        // the node back to `Recv::drop`. Ordering the store *after* taking
+                        // the waker is what prevents `Recv::drop` from racing on it.
                         unsafe {
-                            // Safety: accessing `waker` is safe because
-                            // the tail lock is held.
                             if let Some(waker) = (*waiter.as_ptr()).waker.take() {
                                 wakers.push(waker);
                             }
@@ -1627,8 +1663,20 @@ impl<'a, T> Recv<'a, T> {
     /// A custom `project` implementation is used in place of `pin-project-lite`
     /// as a custom drop implementation is needed.
     fn project(self: Pin<&mut Self>) -> (&mut Receiver<T>, &UnsafeCell<Waiter>) {
+        // SAFETY: This is a pin projection.
+        // Contract from `Pin::get_unchecked_mut`: the caller must not use the returned
+        // `&mut Self` to move the pointee or otherwise break the `Pin` contract for any
+        // `!Unpin` part of it.
+        // Evidence: the `&mut Self` is used only to reborrow two fields. `receiver` is
+        // `&mut Receiver<T>`, which is `Unpin` — asserted at compile time by the
+        // `is_unpin::<..>()` call below so the claim cannot go stale — and projecting an
+        // `Unpin` field out of a pinned struct is unconditionally sound. `waiter` holds a
+        // `Waiter`, which is `!Unpin` (it contains `PhantomPinned`), and is projected only
+        // as `&UnsafeCell<Waiter>`, never as `&mut`, so the `Waiter` cannot be moved out
+        // or replaced through this projection. `Recv` is only ever polled behind a `Pin`,
+        // so the `Waiter`'s address is stable for as long as the intrusive list can hold a
+        // pointer to it; `Recv`'s custom `Drop` unlinks it before the storage goes away.
         unsafe {
-            // Safety: Receiver is Unpin
             is_unpin::<&mut Receiver<T>>();
 
             let me = self.get_unchecked_mut();
@@ -1699,9 +1747,21 @@ impl<'a, T> Drop for Recv<'a, T> {
     }
 }
 
-/// # Safety
-///
-/// `Waiter` is forced to be !Unpin.
+// SAFETY: Implementer obligations of `linked_list::Link`:
+//
+// * `as_raw`/`from_raw` must round-trip a handle through a raw pointer. Here
+//   `Handle == Target == NonNull<Waiter>`, so both are the identity function and the
+//   round-trip is exact; `from_raw` takes no ownership and so adds no obligation.
+// * `pointers` must return the `Pointers` belonging to `target` without creating an
+//   intermediate reference, so that the result keeps the argument's Stacked Borrows tag.
+//   Discharged by `Waiter::addr_of_pointers`, which `generate_addr_of_methods!` expands to
+//   a `&raw mut` projection. Its own precondition — that `target` be valid — is passed
+//   through from this method's caller.
+// * The list stores raw pointers to nodes that must not move while linked. `Waiter`
+//   contains `PhantomPinned`, so it is `!Unpin` and safe code cannot move a pinned one.
+//   Nodes are enqueued from the `WaiterCell` of a pinned `Recv` and unlinked again by
+//   `Recv`'s custom `Drop`, both under the `Shared::tail` lock, so no node is reachable
+//   from the list once its storage goes away.
 unsafe impl linked_list::Link for Waiter {
     type Handle = NonNull<Waiter>;
     type Target = Waiter;
@@ -1715,6 +1775,13 @@ unsafe impl linked_list::Link for Waiter {
     }
 
     unsafe fn pointers(target: NonNull<Waiter>) -> NonNull<linked_list::Pointers<Waiter>> {
+        // SAFETY:
+        // Contract from `Waiter::addr_of_pointers` (expanding to
+        // `&raw mut (*target).pointers`): `target` must point to an allocation laid out
+        // for `Waiter`. That is exactly this method's own `# Safety` precondition,
+        // inherited from `Link::pointers`, and nothing intervenes before the call. Using
+        // `&raw mut` rather than a reference is what satisfies `Link::pointers`'
+        // no-intermediate-reference requirement.
         unsafe { Waiter::addr_of_pointers(target) }
     }
 }
