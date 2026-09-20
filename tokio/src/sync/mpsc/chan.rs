@@ -71,6 +71,22 @@ pub(super) struct Chan<T, S> {
     tx_weak_count: AtomicUsize,
 
     /// Only accessed by `Rx` handle.
+    ///
+    /// Safety invariant: this cell is reachable from every `Tx` and `Rx` handle (they
+    /// all hold an `Arc<Chan<T, S>>`), but only two parties ever dereference it, and
+    /// they cannot overlap:
+    ///
+    /// * The `Rx` handle. A channel has exactly one `Rx`, and `Rx` is neither `Clone`
+    ///   nor `Copy`, so Rust's borrow rules already serialise its own accesses: the
+    ///   methods that form `&mut RxFields<T>` (`close`, `recv`, `recv_many`,
+    ///   `try_recv`, `Rx::drop`) take `&mut self`, and the ones that form
+    ///   `&RxFields<T>` (`is_empty`, `len`) take `&self`, so a unique reference is
+    ///   never live at the same time as any other.
+    /// * `Chan::drop`, which runs only once the last `Arc` clone is gone — in
+    ///   particular after the `Rx` has been dropped — and holds `&mut Chan<T, S>`.
+    ///
+    /// No `Tx` handle ever touches this field. Any new code path that does would
+    /// invalidate every safety proof in this file that cites this invariant.
     rx_fields: UnsafeCell<RxFields<T>>,
 }
 
@@ -107,7 +123,25 @@ impl<T> fmt::Debug for RxFields<T> {
     }
 }
 
+// SAFETY: Implementer obligation of `Send`: transferring ownership of a `Chan<T, S>` to
+// another thread transfers everything it owns. The `UnsafeCell<RxFields<T>>` is what
+// blocks the auto impl; it holds the `list::Rx<T>`, i.e. the queued values, so moving the
+// channel moves those `T`s: hence `T: Send`. `S: Send` covers the semaphore. The remaining
+// fields (`Notify`, `AtomicUsize`, `AtomicWaker`, `list::Tx<T>`) are all `Send` given
+// `T: Send`. No shared access to `T` is created by the move, so `T: Sync` is not required.
 unsafe impl<T: Send, S: Send> Send for Chan<T, S> {}
+// SAFETY: Implementer obligation of `Sync`: `&Chan<T, S>` must be usable from several
+// threads at once — senders on any number of threads plus the single receiver.
+// - `rx_fields`: access is restricted to the receiver (and `Chan::drop`) by the field's
+//   documented safety invariant, so it is never touched from two places at once, and no
+//   `Sync` bound on its contents is needed. What *does* cross threads is the values
+//   themselves: a sender writes a `T` into the queue and the receiver moves it out, which
+//   is an ownership transfer, hence `T: Send`. A `&T` is never shared, so `T: Sync` is
+//   correctly not required.
+// - `semaphore`: shared by every sender concurrently, hence `S: Sync`.
+// - `tx`, `notify_rx_closed`, `rx_waker`, `tx_count`, `tx_weak_count`: `list::Tx<T>` is
+//   the lock-free block list, whose own synchronisation is proved in `list.rs`/`block.rs`;
+//   `Notify`, `AtomicWaker` and `AtomicUsize` are `Sync` on their own terms.
 unsafe impl<T: Send, S: Sync> Sync for Chan<T, S> {}
 impl<T, S> panic::RefUnwindSafe for Chan<T, S> {}
 impl<T, S> panic::UnwindSafe for Chan<T, S> {}
@@ -245,6 +279,20 @@ impl<T, S: Semaphore> Rx<T, S> {
 
     pub(crate) fn close(&mut self) {
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+            // SAFETY:
+            // Operation: creating `&mut RxFields<T>` from the cell pointer.
+            // Required contract: non-null, aligned, pointing to an initialized
+            // `RxFields<T>` for the returned lifetime, and unique — no other reference to
+            // it may be live.
+            // Evidence:
+            // - `UnsafeCell::with_mut` yields a non-null, aligned pointer to the cell's
+            //   contents; the `Chan` is kept alive by the `Arc` in `self.inner`, and the
+            //   `RxFields<T>` was initialized in `channel()`.
+            // - Uniqueness: by the `rx_fields` field's documented safety invariant, only
+            //   the single `Rx` and `Chan::drop` reach this cell. `close` takes
+            //   `&mut self` on that `Rx`, so no other `Rx` method can be running, and
+            //   `Chan::drop` cannot run while this `Rx` still holds an `Arc` clone.
+            // - The reference does not escape the closure.
             let rx_fields = unsafe { &mut *rx_fields_ptr };
 
             if rx_fields.rx_closed {
@@ -273,6 +321,17 @@ impl<T, S: Semaphore> Rx<T, S> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.inner.rx_fields.with(|rx_fields_ptr| {
+            // SAFETY:
+            // Operation: creating `&RxFields<T>` from the cell pointer.
+            // Required contract: non-null, aligned, pointing to an initialized
+            // `RxFields<T>` for the returned lifetime, with no `&mut` alias live over it.
+            // Evidence: liveness and initialization as in `close` above. For aliasing, the
+            // `rx_fields` field's documented safety invariant limits access to the single
+            // `Rx` and to `Chan::drop`; this method takes `&self` on that `Rx`, so the
+            // borrow checker rules out any concurrent `&mut self` method of the same `Rx`,
+            // and `Chan::drop` cannot run while this `Rx` holds an `Arc` clone. Two
+            // concurrent `&self` callers would each only form a shared reference, which is
+            // permitted.
             let rx_fields = unsafe { &*rx_fields_ptr };
             rx_fields.list.is_empty(&self.inner.tx)
         })
@@ -280,6 +339,10 @@ impl<T, S: Semaphore> Rx<T, S> {
 
     pub(crate) fn len(&self) -> usize {
         self.inner.rx_fields.with(|rx_fields_ptr| {
+            // SAFETY: Identical to the `&RxFields<T>` proof in `is_empty` above: this is a
+            // shared reference formed under `&self` on the single `Rx`, and the
+            // `rx_fields` field's documented safety invariant excludes every other
+            // accessor.
             let rx_fields = unsafe { &*rx_fields_ptr };
             rx_fields.list.len(&self.inner.tx)
         })
@@ -295,6 +358,10 @@ impl<T, S: Semaphore> Rx<T, S> {
         let coop = ready!(crate::task::coop::poll_proceed(cx));
 
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+            // SAFETY: Identical to the `&mut RxFields<T>` proof in `close` above: `recv`
+            // takes `&mut self` on the single `Rx`, so by the `rx_fields` field's
+            // documented safety invariant this is the only live reference to the cell's
+            // contents, and it does not escape the closure.
             let rx_fields = unsafe { &mut *rx_fields_ptr };
 
             macro_rules! try_recv {
@@ -363,6 +430,10 @@ impl<T, S: Semaphore> Rx<T, S> {
         let initial_length = buffer.len();
 
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+            // SAFETY: Identical to the `&mut RxFields<T>` proof in `close` above:
+            // `recv_many` takes `&mut self` on the single `Rx`, so by the `rx_fields`
+            // field's documented safety invariant this is the only live reference to the
+            // cell's contents, and it does not escape the closure.
             let rx_fields = unsafe { &mut *rx_fields_ptr };
             macro_rules! try_recv {
                 () => {
@@ -425,6 +496,10 @@ impl<T, S: Semaphore> Rx<T, S> {
         use super::list::TryPopResult;
 
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+            // SAFETY: Identical to the `&mut RxFields<T>` proof in `close` above:
+            // `try_recv` takes `&mut self` on the single `Rx`, so by the `rx_fields`
+            // field's documented safety invariant this is the only live reference to the
+            // cell's contents, and it does not escape the closure.
             let rx_fields = unsafe { &mut *rx_fields_ptr };
 
             macro_rules! try_recv {
@@ -491,6 +566,11 @@ impl<T, S: Semaphore> Drop for Rx<T, S> {
         self.close();
 
         self.inner.rx_fields.with_mut(|rx_fields_ptr| {
+            // SAFETY: Identical to the `&mut RxFields<T>` proof in `close` above:
+            // `Rx::drop` holds `&mut self` on the single `Rx`, so by the `rx_fields`
+            // field's documented safety invariant this is the only live reference to the
+            // cell's contents. `Chan::drop` cannot be running concurrently, because this
+            // `Rx` still holds its `Arc` clone until after `drop` returns.
             let rx_fields = unsafe { &mut *rx_fields_ptr };
             struct Guard<'a, T, S: Semaphore> {
                 list: &'a mut list::Rx<T>,
@@ -561,12 +641,30 @@ impl<T, S> Drop for Chan<T, S> {
     fn drop(&mut self) {
         use super::block::Read::Value;
 
-        // Safety: the only owner of the rx fields is Chan, and being
-        // inside its own Drop means we're the last ones to touch it.
         self.rx_fields.with_mut(|rx_fields_ptr| {
+            // SAFETY:
+            // Operation: creating `&mut RxFields<T>` from the cell pointer.
+            // Required contract: non-null, aligned, initialized, and unique for the
+            // returned lifetime.
+            // Evidence: `UnsafeCell::with_mut` yields a non-null, aligned pointer, and the
+            // `RxFields<T>` was initialized in `channel()`. For uniqueness: this is
+            // `Chan::drop`, so we hold `&mut self` and the last `Arc` clone has just been
+            // released — every `Tx` and the `Rx` are gone, so by the `rx_fields` field's
+            // documented safety invariant nobody else can reach the cell.
             let rx_fields = unsafe { &mut *rx_fields_ptr };
 
             while let Some(Value(_)) = rx_fields.list.pop(&self.tx) {}
+            // SAFETY:
+            // Contract from `list::Rx::free_blocks`: it must be called at most once, no
+            // sender may still reach any block, and any values left in the blocks are
+            // leaked rather than dropped.
+            // Evidence:
+            // - At most once: `Chan::drop` runs exactly once per channel, and this is the
+            //   only call site.
+            // - No senders remain: `Chan::drop` runs only when the last `Arc<Chan>` clone
+            //   is released, and every `Tx` holds one.
+            // - Values drained: the loop above pops until the list yields no more
+            //   `Read::Value`, dropping each `T`, so no slot still owns a value.
             unsafe { rx_fields.list.free_blocks() };
         });
     }
