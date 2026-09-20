@@ -18,6 +18,13 @@ pub struct OwnedRwLockReadGuard<T: ?Sized, U: ?Sized = T> {
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     pub(super) resource_span: tracing::Span,
     pub(super) lock: Arc<RwLock<T>>,
+    // Safety invariant: `data` is non-null, aligned for `U`, and points to a live,
+    // initialized `U` reached from the `T` inside `lock`'s `UnsafeCell` — either that
+    // `T` itself or a projection of it produced by `map`/`try_map`. The guard keeps its
+    // own `Arc` clone alive in `lock`, so the allocation backing the `T` outlives the
+    // guard, and the guard holds a read permit on `lock.s` for its whole lifetime, so no
+    // writer can hold `&mut` to that value. `data` may therefore be dereferenced as
+    // `&U`, but never as `&mut U`.
     pub(super) data: *const U,
     pub(super) _p: PhantomData<T>,
 }
@@ -170,6 +177,20 @@ impl<T: ?Sized, U: ?Sized> ops::Deref for OwnedRwLockReadGuard<T, U> {
     type Target = U;
 
     fn deref(&self) -> &U {
+        // SAFETY:
+        // Operation: creating `&U` from the raw pointer `self.data`.
+        // Required contract: `self.data` must be non-null, aligned for `U`, point to a
+        // live and initialized `U` for the whole returned lifetime, and no `&mut U` to
+        // that value may exist for that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant, established by every constructor of this type.
+        // - The returned lifetime is tied to `&self`, so it ends no later than the guard.
+        //   The guard owns an `Arc` clone in `lock`, so the `RwLock` allocation — and the
+        //   `T` the pointee is projected from — cannot be freed while the guard lives.
+        // - The guard holds a read permit on `lock.s` until dropped. A writer must acquire
+        //   all `mr` permits, which cannot succeed while this permit is outstanding, so no
+        //   `&mut` alias to the value can exist.
         unsafe { &*self.data }
     }
 }

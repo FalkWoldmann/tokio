@@ -20,6 +20,14 @@ pub struct OwnedRwLockMappedWriteGuard<T: ?Sized, U: ?Sized = T> {
     pub(super) resource_span: tracing::Span,
     pub(super) permits_acquired: u32,
     pub(super) lock: Arc<RwLock<T>>,
+    // Safety invariant: `data` is non-null, aligned for `U`, and points to a live,
+    // initialized `U` reached from the `T` inside `lock`'s `UnsafeCell` — a projection
+    // of it produced by `map`/`try_map` on an owned write guard. The guard keeps its own
+    // `Arc` clone alive in `lock`, so that allocation outlives the guard, and it holds
+    // `permits_acquired` write permits (all `mr` of them) on `lock.s` for its whole
+    // lifetime, so no other reader or writer can hold any reference into the locked
+    // value. `data` may therefore be dereferenced as `&U` or `&mut U`, subject to the
+    // usual aliasing rules between those two within this guard.
     pub(super) data: *mut U,
     pub(super) _p: PhantomData<T>,
 }
@@ -186,12 +194,36 @@ impl<T: ?Sized, U: ?Sized> ops::Deref for OwnedRwLockMappedWriteGuard<T, U> {
     type Target = U;
 
     fn deref(&self) -> &U {
+        // SAFETY:
+        // Operation: creating `&U` from the raw pointer `self.data`.
+        // Required contract: non-null, aligned for `U`, pointing to a live initialized
+        // `U` for the returned lifetime, with no `&mut U` alias live over that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant.
+        // - The guard owns an `Arc` clone in `lock`, so the `RwLock` allocation — and the
+        //   `T` the pointee is projected from — cannot be freed while the guard lives,
+        //   and it holds all `mr` write permits on `lock.s`, so no other guard exists.
+        // - The returned lifetime is tied to `&self`, so `deref_mut` (which needs
+        //   `&mut self`) cannot produce an overlapping `&mut U` from this guard.
         unsafe { &*self.data }
     }
 }
 
 impl<T: ?Sized, U: ?Sized> ops::DerefMut for OwnedRwLockMappedWriteGuard<T, U> {
     fn deref_mut(&mut self) -> &mut U {
+        // SAFETY:
+        // Operation: creating `&mut U` from the raw pointer `self.data`.
+        // Required contract: non-null, aligned for `U`, pointing to a live initialized
+        // `U` for the returned lifetime, and unique over that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant.
+        // - The guard owns an `Arc` clone in `lock` and holds all `mr` write permits on
+        //   `lock.s` until it is dropped, so the allocation stays live and the `RwLock`
+        //   cannot hand out any other guard.
+        // - The returned lifetime is tied to `&mut self`, so no `&U` from `deref` on this
+        //   guard can be live at the same time.
         unsafe { &mut *self.data }
     }
 }

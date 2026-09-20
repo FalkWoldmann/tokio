@@ -21,6 +21,13 @@ pub struct OwnedRwLockWriteGuard<T: ?Sized> {
     pub(super) resource_span: tracing::Span,
     pub(super) permits_acquired: u32,
     pub(super) lock: Arc<RwLock<T>>,
+    // Safety invariant: `data` is non-null, aligned for `T`, and points to the live,
+    // initialized `T` inside `lock`'s `UnsafeCell`. The guard keeps its own `Arc` clone
+    // alive in `lock`, so that allocation outlives the guard, and the guard holds
+    // `permits_acquired` write permits (all `mr` of them) on `lock.s` for its whole
+    // lifetime, so no other reader or writer can hold any reference to that value.
+    // `data` may therefore be dereferenced as `&T` or `&mut T`, subject to the usual
+    // aliasing rules between those two within this guard.
     pub(super) data: *mut T,
     pub(super) _p: PhantomData<T>,
 }
@@ -416,12 +423,36 @@ impl<T: ?Sized> ops::Deref for OwnedRwLockWriteGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        // SAFETY:
+        // Operation: creating `&T` from the raw pointer `self.data`.
+        // Required contract: non-null, aligned for `T`, pointing to a live initialized
+        // `T` for the returned lifetime, with no `&mut T` alias live over that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant.
+        // - The guard owns an `Arc` clone in `lock`, so the `RwLock` allocation cannot be
+        //   freed while the guard lives, and it holds all `mr` write permits on `lock.s`,
+        //   so no other guard into the same lock exists.
+        // - The returned lifetime is tied to `&self`, so `deref_mut` (which needs
+        //   `&mut self`) cannot produce an overlapping `&mut T` from this guard.
         unsafe { &*self.data }
     }
 }
 
 impl<T: ?Sized> ops::DerefMut for OwnedRwLockWriteGuard<T> {
     fn deref_mut(&mut self) -> &mut T {
+        // SAFETY:
+        // Operation: creating `&mut T` from the raw pointer `self.data`.
+        // Required contract: non-null, aligned for `T`, pointing to a live initialized
+        // `T` for the returned lifetime, and unique over that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant.
+        // - The guard owns an `Arc` clone in `lock` and holds all `mr` write permits on
+        //   `lock.s` until it is dropped, so the allocation stays live and the `RwLock`
+        //   cannot hand out any other guard.
+        // - The returned lifetime is tied to `&mut self`, so no `&T` from `deref` on this
+        //   guard can be live at the same time.
         unsafe { &mut *self.data }
     }
 }

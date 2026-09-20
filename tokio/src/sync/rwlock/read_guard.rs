@@ -18,6 +18,12 @@ pub struct RwLockReadGuard<'a, T: ?Sized> {
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     pub(super) resource_span: tracing::Span,
     pub(super) s: &'a Semaphore,
+    // Safety invariant: `data` is non-null, aligned for `T`, and points to a live,
+    // initialized `T` that stays valid for `'a`. It is either the `RwLock`'s own
+    // `UnsafeCell` contents or a projection of them produced by `map`/`try_map`.
+    // For as long as this guard lives it holds a read permit on `s`, so no writer can
+    // hold `&mut T` to that value; `data` may therefore be dereferenced as `&T`, but
+    // never as `&mut T`.
     pub(super) data: *const T,
     pub(super) marker: PhantomData<&'a T>,
 }
@@ -153,6 +159,19 @@ impl<T: ?Sized> ops::Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
+        // SAFETY:
+        // Operation: creating `&T` from the raw pointer `self.data`.
+        // Required contract: `self.data` must be non-null, aligned for `T`, point to a
+        // live and initialized `T` for the whole returned lifetime, and no `&mut T` to
+        // that value may exist for that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant, which every constructor of this type establishes.
+        // - The returned lifetime is tied to `&self` and so cannot outlive the guard,
+        //   and the guard's invariant keeps `data` valid for at least `'a`.
+        // - The guard holds a read permit on `s` until it is dropped. Write access is
+        //   only handed out by `RwLock` after acquiring all `mr` permits, which cannot
+        //   succeed while this permit is outstanding, so no `&mut T` aliases the value.
         unsafe { &*self.data }
     }
 }

@@ -193,6 +193,13 @@ pub struct MappedMutexGuard<'a, T: ?Sized> {
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     resource_span: tracing::Span,
     s: &'a semaphore::Semaphore,
+    // Safety invariant: `data` is non-null, aligned for `T`, and points to a live,
+    // initialized `T` that stays valid for `'a` — a projection of the `Mutex`'s
+    // `UnsafeCell` contents produced by `MutexGuard::map`/`try_map`. For as long as this
+    // guard lives it holds the mutex's single permit on `s`, so no other guard into the
+    // same `Mutex` exists and no other thread can reach the locked value. `data` may
+    // therefore be dereferenced as `&T` or `&mut T`, subject to the usual aliasing rules
+    // between those two within this guard.
     data: *mut T,
     // Needed to tell the borrow checker that we are holding a `&mut T`
     marker: PhantomData<&'a mut T>,
@@ -211,6 +218,13 @@ pub struct OwnedMappedMutexGuard<T: ?Sized, U: ?Sized = T> {
     // `skip_drop` method.
     #[cfg(all(tokio_unstable, feature = "tracing"))]
     resource_span: tracing::Span,
+    // Safety invariant: `data` is non-null, aligned for `U`, and points to a live,
+    // initialized `U` reached from the `T` inside `lock`'s `UnsafeCell` — a projection of
+    // it produced by `OwnedMutexGuard::map`/`try_map`. The guard keeps its own `Arc` clone
+    // alive in `lock`, so that allocation outlives the guard, and it holds the mutex's
+    // single permit for its whole lifetime, so no other guard into the same `Mutex`
+    // exists. `data` may therefore be dereferenced as `&U` or `&mut U`, subject to the
+    // usual aliasing rules between those two within this guard.
     data: *mut U,
     lock: Arc<Mutex<T>>,
 }
@@ -252,22 +266,69 @@ struct OwnedMappedMutexGuardInner<T: ?Sized, U: ?Sized> {
     lock: Arc<Mutex<T>>,
 }
 
-// As long as T: Send, it's fine to send and share Mutex<T> between threads.
-// If T was not Send, sending and sharing a Mutex<T> would be bad, since you can
-// access T through Mutex<T>.
+// `Mutex<T>` holds `UnsafeCell<T>`, which is never `Sync`, so the `Sync` impl must be
+// written out by hand.
+//
+// SAFETY: Implementer obligation of `Send`: transferring ownership of a `Mutex<T>` to
+// another thread transfers the `T` inside it. The other field, `s: Semaphore`, is `Send`.
+// `T: Send` licenses exactly that transfer, and no shared access to `T` is created, so
+// `T: Sync` is not required.
 unsafe impl<T> Send for Mutex<T> where T: ?Sized + Send {}
+// SAFETY: Implementer obligation of `Sync`: `&Mutex<T>` must be usable from several
+// threads at once. The only data capability reachable through a shared reference is
+// `lock()`/`try_lock()`, which returns a guard granting `&mut T`. The `Semaphore` in `s`
+// has a single permit, so at most one guard exists at a time and the `&mut T` it grants is
+// genuinely exclusive — two threads can never hold references to the `T` simultaneously.
+// What crosses the thread boundary is therefore exclusive access to (and the ability to
+// move out and drop) the `T`, which is `T: Send`. Unlike `RwLock`, no aliased `&T` is ever
+// handed out, so `T: Sync` is correctly *not* required here.
 unsafe impl<T> Sync for Mutex<T> where T: ?Sized + Send {}
+// SAFETY: `MutexGuard` stores only `&'a Mutex<T>`, so it would be `Sync` automatically
+// whenever `Mutex<T>: Sync`, i.e. whenever `T: Send`. That auto impl would be too weak:
+// `&MutexGuard<'_, T>` yields `&T` through `Deref`, so sharing a guard across threads
+// hands out aliased `&T`, which requires `T: Sync`. This explicit impl overrides the auto
+// impl with the stronger `T: Send + Sync` bound, which covers both the `&T` exposure
+// (`T: Sync`) and the `&'a Mutex<T>` field (`T: Send`). `DerefMut` needs `&mut self` and
+// so is not reachable from a shared reference.
 unsafe impl<T> Sync for MutexGuard<'_, T> where T: ?Sized + Send + Sync {}
+// SAFETY: Same argument as `MutexGuard`, with `Arc<Mutex<T>>` in place of `&'a Mutex<T>`:
+// `&OwnedMutexGuard<T>` yields `&T` (`Deref`), requiring `T: Sync`, and `&Arc<Mutex<T>>`
+// (`OwnedMutexGuard::mutex`), requiring `Arc<Mutex<T>>: Sync`, i.e.
+// `Mutex<T>: Send + Sync`, i.e. `T: Send`. Both are implied by `T: Send + Sync`.
 unsafe impl<T> Sync for OwnedMutexGuard<T> where T: ?Sized + Send + Sync {}
+// SAFETY: `MappedMutexGuard` stores `*mut T`, which is neither `Send` nor `Sync`, so both
+// impls are explicit. It exposes no accessor for the `Mutex` itself, so the only data
+// capabilities are `Deref` and `DerefMut`:
+// - `&Guard` yields only `&T`, so sharing it across threads requires exactly `T: Sync`.
+// - Moving the guard to another thread gives that thread `&mut T`, from which it can move
+//   the `T` out and drop it there, so sending requires exactly `T: Send`. The guard holds
+//   the mutex's single permit for its whole lifetime, so the originating thread retains no
+//   way to reach the value concurrently, and `T: Sync` is correctly not required.
 unsafe impl<'a, T> Sync for MappedMutexGuard<'a, T> where T: ?Sized + Sync + 'a {}
+// SAFETY: See the shared argument for `MappedMutexGuard` directly above.
 unsafe impl<'a, T> Send for MappedMutexGuard<'a, T> where T: ?Sized + Send + 'a {}
 
+// SAFETY: `&OwnedMappedMutexGuard<T, U>` yields `&U` through `Deref`, requiring `U: Sync`.
+// The guard also holds an `Arc<Mutex<T>>`; sharing the guard makes that `Arc` reachable
+// from another thread only through the guard's own API, but the bound `T: Send + Sync` is
+// in any case at least as strong as the `Arc<Mutex<T>>: Sync` requirement
+// (`Mutex<T>: Send + Sync`, i.e. `T: Send`). The extra `U: Send` is stricter than required
+// and is kept for backwards compatibility.
 unsafe impl<T, U> Sync for OwnedMappedMutexGuard<T, U>
 where
     T: ?Sized + Send + Sync,
     U: ?Sized + Send + Sync,
 {
 }
+// SAFETY: Moving an `OwnedMappedMutexGuard<T, U>` to another thread moves two things:
+// - `data: *mut U`, from which that thread obtains `&mut U` via `DerefMut` and can move
+//   the `U` out and drop it there: `U: Send`.
+// - `lock: Arc<Mutex<T>>`, which may be the last `Arc` clone, so the receiving thread may
+//   drop the `Mutex<T>` and the `T` inside it. Sending an `Arc<X>` requires
+//   `X: Send + Sync`; for `X = Mutex<T>` both hold exactly when `T: Send`.
+// The guard holds the mutex's single permit until it is dropped, so no other thread can
+// reach the locked value while this one has it, and neither `T: Sync` nor `U: Sync` is
+// required.
 unsafe impl<T, U> Send for OwnedMappedMutexGuard<T, U>
 where
     T: ?Sized + Send,
@@ -978,12 +1039,37 @@ impl<T: ?Sized> Drop for MutexGuard<'_, T> {
 impl<T: ?Sized> Deref for MutexGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
+        // SAFETY:
+        // Operation: creating `&T` from `UnsafeCell::get`.
+        // Required contract: `UnsafeCell::get` always returns a non-null, aligned pointer
+        // to the cell's contents (std docs), so what remains to prove is that no
+        // conflicting access exists for the returned lifetime, and that the pointee is a
+        // live, initialized `T`.
+        // Evidence:
+        // - `self.lock` is `&'a Mutex<T>`, so the `Mutex` — and the initialized `T` its
+        //   `UnsafeCell` holds, established by `Mutex::new` — outlives the guard, and the
+        //   returned lifetime is tied to `&self`, so it ends no later than the guard.
+        // - Existence of this guard means it holds the mutex's single semaphore permit,
+        //   which is only released in the guard's `Drop`. No other guard for the same
+        //   `Mutex` can exist, so no other thread can form a reference to the value.
+        // - Within this guard, `deref_mut` requires `&mut self`, so the borrow checker
+        //   rules out an overlapping `&mut T`.
         unsafe { &*self.lock.c.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY:
+        // Operation: creating `&mut T` from `UnsafeCell::get`.
+        // Required contract: as for `deref` above, plus uniqueness — no other reference to
+        // the value may be live for the returned lifetime.
+        // Evidence:
+        // - Liveness and initialization: as for `deref` above.
+        // - This guard holds the mutex's single semaphore permit until dropped, so no
+        //   other guard exists and no other thread can reach the value.
+        // - The returned lifetime is tied to `&mut self`, so no `&T` produced by `deref`
+        //   on this guard can be live at the same time.
         unsafe { &mut *self.lock.c.get() }
     }
 }
@@ -1160,12 +1246,35 @@ impl<T: ?Sized> Drop for OwnedMutexGuard<T> {
 impl<T: ?Sized> Deref for OwnedMutexGuard<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
+        // SAFETY:
+        // Operation: creating `&T` from `UnsafeCell::get`.
+        // Required contract: no conflicting access for the returned lifetime, and the
+        // pointee is a live, initialized `T`. (`UnsafeCell::get` is documented to return a
+        // non-null, aligned pointer to the cell's contents.)
+        // Evidence:
+        // - The guard owns an `Arc` clone in `self.lock`, so the `Mutex` allocation — and
+        //   the initialized `T` established by `Mutex::new` — cannot be freed while the
+        //   guard lives; the returned lifetime is tied to `&self`.
+        // - This guard holds the mutex's single semaphore permit, released only in its
+        //   `Drop`, so no other guard exists and no other thread can reach the value.
+        // - `deref_mut` requires `&mut self`, so no overlapping `&mut T` can be formed
+        //   from this guard.
         unsafe { &*self.lock.c.get() }
     }
 }
 
 impl<T: ?Sized> DerefMut for OwnedMutexGuard<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY:
+        // Operation: creating `&mut T` from `UnsafeCell::get`.
+        // Required contract: as for `deref` above, plus uniqueness for the returned
+        // lifetime.
+        // Evidence:
+        // - Liveness and initialization: as for `deref` above, via the owned `Arc` clone.
+        // - This guard holds the mutex's single semaphore permit until dropped, so no
+        //   other guard exists and no other thread can reach the value.
+        // - The returned lifetime is tied to `&mut self`, so no `&T` produced by `deref`
+        //   on this guard can be live at the same time.
         unsafe { &mut *self.lock.c.get() }
     }
 }
@@ -1265,12 +1374,34 @@ impl<'a, T: ?Sized> Drop for MappedMutexGuard<'a, T> {
 impl<'a, T: ?Sized> Deref for MappedMutexGuard<'a, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
+        // SAFETY:
+        // Operation: creating `&T` from the raw pointer `self.data`.
+        // Required contract: non-null, aligned for `T`, pointing to a live initialized `T`
+        // for the returned lifetime, with no `&mut T` alias live over that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant, established by `MutexGuard::map`/`try_map`.
+        // - The guard holds the mutex's single semaphore permit on `s` until dropped, so
+        //   no other guard into the same `Mutex` exists.
+        // - The returned lifetime is tied to `&self`, so `deref_mut` (which needs
+        //   `&mut self`) cannot produce an overlapping `&mut T` from this guard.
         unsafe { &*self.data }
     }
 }
 
 impl<'a, T: ?Sized> DerefMut for MappedMutexGuard<'a, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY:
+        // Operation: creating `&mut T` from the raw pointer `self.data`.
+        // Required contract: as for `deref` above, plus uniqueness for the returned
+        // lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant.
+        // - The guard holds the mutex's single semaphore permit on `s` until dropped, so
+        //   no other guard into the same `Mutex` exists.
+        // - The returned lifetime is tied to `&mut self`, so no `&T` from `deref` on this
+        //   guard can be live at the same time.
         unsafe { &mut *self.data }
     }
 }
@@ -1373,12 +1504,35 @@ impl<T: ?Sized, U: ?Sized> Drop for OwnedMappedMutexGuard<T, U> {
 impl<T: ?Sized, U: ?Sized> Deref for OwnedMappedMutexGuard<T, U> {
     type Target = U;
     fn deref(&self) -> &Self::Target {
+        // SAFETY:
+        // Operation: creating `&U` from the raw pointer `self.data`.
+        // Required contract: non-null, aligned for `U`, pointing to a live initialized `U`
+        // for the returned lifetime, with no `&mut U` alias live over that lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant, established by `OwnedMutexGuard::map`/`try_map`.
+        // - The guard owns an `Arc` clone in `lock`, so the `Mutex` allocation — and the
+        //   `T` the pointee is projected from — cannot be freed while the guard lives, and
+        //   it holds the mutex's single permit, so no other guard exists.
+        // - The returned lifetime is tied to `&self`, so `deref_mut` (which needs
+        //   `&mut self`) cannot produce an overlapping `&mut U` from this guard.
         unsafe { &*self.data }
     }
 }
 
 impl<T: ?Sized, U: ?Sized> DerefMut for OwnedMappedMutexGuard<T, U> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY:
+        // Operation: creating `&mut U` from the raw pointer `self.data`.
+        // Required contract: as for `deref` above, plus uniqueness for the returned
+        // lifetime.
+        // Evidence:
+        // - Validity, alignment and initialization hold by the field's documented safety
+        //   invariant.
+        // - The guard owns an `Arc` clone in `lock` and holds the mutex's single permit
+        //   until dropped, so the allocation stays live and no other guard exists.
+        // - The returned lifetime is tied to `&mut self`, so no `&U` from `deref` on this
+        //   guard can be live at the same time.
         unsafe { &mut *self.data }
     }
 }

@@ -142,46 +142,107 @@ fn bounds() {
     check_send_sync_val(Arc::clone(&rwlock).write_owned());
 }
 
-// As long as T: Send + Sync, it's fine to send and share RwLock<T> between threads.
-// If T were not Send, sending and sharing a RwLock<T> would be bad, since you can access T through
-// RwLock<T>.
+// `RwLock<T>` holds `UnsafeCell<T>`, which is never `Sync`, so both impls must be
+// written out by hand.
+//
+// SAFETY: Implementer obligation of `Send`: it must be sound to transfer ownership of
+// a `RwLock<T>` to another thread. Besides `UnsafeCell<T>`, the only fields are `mr: u32`
+// and `s: Semaphore`, which are both `Send`. Transferring the lock transfers the `T`
+// stored inside it, and `T: Send` permits exactly that. No shared access is created, so
+// `T: Sync` is not required.
 unsafe impl<T> Send for RwLock<T> where T: ?Sized + Send {}
+// SAFETY: Implementer obligation of `Sync`: `&RwLock<T>` must be sound to use from several
+// threads at once, i.e. `&RwLock<T>` must be `Send`. Two capabilities are reachable through
+// a shared reference:
+//
+// - `read()`/`try_read()` hand out `&T` to any number of threads concurrently. Aliased shared
+//   access to `T` from multiple threads is exactly what `T: Sync` licenses.
+// - `write()`/`try_write()` hand out `&mut T`, from which a caller can move the `T` out (for
+//   example with `mem::replace`) onto the acquiring thread, and can drop the replaced value
+//   there. That is a cross-thread ownership transfer of `T`, which requires `T: Send`.
+//
+// The `Semaphore` in `s` is itself `Sync` and is what makes those two capabilities mutually
+// exclusive at runtime, so no `&T` is ever live at the same time as an `&mut T`. Data-race
+// freedom therefore rests on the semaphore, while `T: Send + Sync` discharges the auto-trait
+// obligations of the references the API produces.
 unsafe impl<T> Sync for RwLock<T> where T: ?Sized + Send + Sync {}
-// NB: These impls need to be explicit since we're storing a raw pointer.
-// Safety: Stores a raw pointer to `T`, so if `T` is `Sync`, the lock guard over
-// `T` is `Send`.
+
+// The guards below all store a raw pointer (`data`), and raw pointers are neither `Send` nor
+// `Sync`, so every guard needs explicit impls. In each case the referent's validity comes from
+// the guard's documented field invariant, and mutual exclusion comes from the `Semaphore`
+// permits the guard holds; the bounds below only have to discharge the auto-trait obligations
+// of the references each guard's public API can produce.
+
+// SAFETY: A `RwLockReadGuard` is a borrowing read guard: its only data capability is
+// `Deref::deref`, producing `&T`. Sending the guard to another thread therefore lets that
+// thread hold `&T` while other readers on other threads hold `&T` to the same value, which is
+// precisely `T: Sync`. The guard cannot move, mutate, or drop the `T` (it holds `*const T` and
+// its `Drop` only releases semaphore permits), so `T: Send` is not required.
 unsafe impl<T> Send for RwLockReadGuard<'_, T> where T: ?Sized + Sync {}
+// SAFETY: `&RwLockReadGuard<'_, T>` yields only `&T` (via `Deref`), so `T: Sync` alone would
+// discharge the obligation; the additional `T: Send` bound is stricter than required and is
+// kept for backwards compatibility. `T: Sync` is what the proof actually relies on.
 unsafe impl<T> Sync for RwLockReadGuard<'_, T> where T: ?Sized + Send + Sync {}
-// T is required to be `Send` because an OwnedRwLockReadGuard can be used to drop the value held in
-// the RwLock, unlike RwLockReadGuard.
+// SAFETY: An `OwnedRwLockReadGuard<T, U>` additionally owns an `Arc<RwLock<T>>`, so it has
+// strictly more capability than `RwLockReadGuard`:
+//
+// - `Deref` yields `&U`, so the receiving thread holds `&U` concurrently with other readers:
+//   `U: Sync`.
+// - `OwnedRwLockReadGuard::rwlock` yields `&Arc<RwLock<T>>`, and dropping the guard drops its
+//   `Arc` clone, which may be the last one and so may drop the `RwLock<T>` — and the `T` inside
+//   it — on the receiving thread. Sending an `Arc<X>` requires `X: Send + Sync`; here
+//   `X = RwLock<T>`, which is `Send` when `T: Send` and `Sync` when `T: Send + Sync`. Hence
+//   `T: Send + Sync`.
+//
+// This is why `T: Send` is required here but not for `RwLockReadGuard`: the borrowing guard can
+// never be the one that drops the value.
 unsafe impl<T, U> Send for OwnedRwLockReadGuard<T, U>
 where
     T: ?Sized + Send + Sync,
     U: ?Sized + Sync,
 {
 }
+// SAFETY: `&OwnedRwLockReadGuard<T, U>` yields `&U` (via `Deref`) and `&Arc<RwLock<T>>` (via
+// `rwlock`). Sharing the latter across threads requires `Arc<RwLock<T>>: Sync`, i.e.
+// `RwLock<T>: Send + Sync`, i.e. `T: Send + Sync`. Sharing `&U` requires `U: Sync`. The extra
+// `U: Send` bound is stricter than required and is kept for backwards compatibility.
 unsafe impl<T, U> Sync for OwnedRwLockReadGuard<T, U>
 where
     T: ?Sized + Send + Sync,
     U: ?Sized + Send + Sync,
 {
 }
+// SAFETY: A shared reference to a write guard yields only `&T`/`&U` — `DerefMut` needs `&mut`
+// self, so no `&mut T` is reachable from `&Guard`. Sharing the guard across threads therefore
+// requires only that the referent be `Sync`. The owned variants additionally expose
+// `&Arc<RwLock<T>>` through `rwlock`, which requires `T: Send + Sync` as argued above. The
+// bounds below are uniformly `Send + Sync`, which is at least as strong as each of these
+// requirements.
 unsafe impl<T> Sync for RwLockWriteGuard<'_, T> where T: ?Sized + Send + Sync {}
+// SAFETY: See the shared argument for write-guard `Sync` impls directly above.
 unsafe impl<T> Sync for OwnedRwLockWriteGuard<T> where T: ?Sized + Send + Sync {}
+// SAFETY: See the shared argument for write-guard `Sync` impls directly above.
 unsafe impl<T> Sync for RwLockMappedWriteGuard<'_, T> where T: ?Sized + Send + Sync {}
+// SAFETY: See the shared argument for write-guard `Sync` impls directly above.
 unsafe impl<T, U> Sync for OwnedRwLockMappedWriteGuard<T, U>
 where
     T: ?Sized + Send + Sync,
     U: ?Sized + Send + Sync,
 {
 }
-// Safety: Stores a raw pointer to `T`, so if `T` is `Sync`, the lock guard over
-// `T` is `Send` - but since this is also provides mutable access, we need to
-// make sure that `T` is `Send` since its value can be sent across thread
-// boundaries.
+// SAFETY: A write guard grants `&mut T` through `DerefMut`. Sending it to another thread lets
+// that thread move the `T` out (e.g. `mem::replace`, `mem::swap`) and drop the previous value
+// there, which is a cross-thread ownership transfer of `T` and so requires `T: Send`. The
+// owned variants also carry an `Arc<RwLock<T>>` whose transfer and possible last-reference drop
+// require `T: Send + Sync`, as argued for `OwnedRwLockReadGuard` above. The `T: Sync` bound on
+// the borrowing variants is stricter than required (the write permits held by the guard make
+// concurrent `&T` unobtainable while it lives) and is kept for backwards compatibility.
 unsafe impl<T> Send for RwLockWriteGuard<'_, T> where T: ?Sized + Send + Sync {}
+// SAFETY: See the shared argument for write-guard `Send` impls directly above.
 unsafe impl<T> Send for OwnedRwLockWriteGuard<T> where T: ?Sized + Send + Sync {}
+// SAFETY: See the shared argument for write-guard `Send` impls directly above.
 unsafe impl<T> Send for RwLockMappedWriteGuard<'_, T> where T: ?Sized + Send + Sync {}
+// SAFETY: See the shared argument for write-guard `Send` impls directly above.
 unsafe impl<T, U> Send for OwnedRwLockMappedWriteGuard<T, U>
 where
     T: ?Sized + Send + Sync,
